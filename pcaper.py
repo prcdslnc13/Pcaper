@@ -7,6 +7,7 @@ recovering G-code sent to CNC machines, laser cutters, 3D printers, etc.
 """
 
 import argparse
+import asyncio
 import shutil
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,22 @@ class USBPacket:
     destination: str
     direction: str  # "OUT" (host->device) or "IN" (device->host)
     raw_data: bytes
+    protocol: str = "USB"  # "SERIAL", "USB", "TCP", or "HTTP"
+
+
+def ensure_event_loop() -> None:
+    """
+    Ensure an asyncio event loop exists for the current thread.
+
+    pyshark relies on an implicit event loop in the main thread. Python 3.14
+    removed that implicit loop, so ``get_event_loop()`` raises RuntimeError and
+    pyshark fails with "There is no current event loop in thread 'MainThread'".
+    Creating one explicitly restores the expected behavior.
+    """
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def check_tshark() -> None:
@@ -52,33 +69,52 @@ def hex_to_bytes(hex_string: str) -> bytes:
     return bytes.fromhex(hex_clean)
 
 
-def extract_usb_packets(pcap_path: str) -> Generator[USBPacket, None, None]:
+def extract_usb_packets(
+    pcap_path: str,
+    include_net: bool = False,
+) -> Generator[USBPacket, None, None]:
     """
-    Extract USB packets with payload data from a pcap file.
+    Extract packets with payload data from a USB pcap file.
 
     Checks multiple possible data locations:
-    - usb.capdata (generic USB leftover capture data)
     - usbcom.data.in_payload (USB CDC serial incoming data)
     - usbcom.data.out_payload (USB CDC serial outgoing data)
+    - usb.capdata (generic USB leftover capture data)
+
+    When ``include_net`` is set, also extracts TCP payloads carried over the USB
+    link (network-over-USB via RNDIS/MBIM/ECM, i.e. usb -> eth -> ip -> tcp).
+    Many devices expose themselves as a USB network adapter and do the real work
+    over TCP/HTTP, which is invisible to the serial/capdata extraction above.
 
     Args:
         pcap_path: Path to the pcap file
+        include_net: If True, also yield TCP-over-USB payloads
 
     Yields:
         USBPacket objects for each packet containing payload data
     """
+    ensure_event_loop()
     cap = pyshark.FileCapture(pcap_path)
 
     for packet in cap:
         try:
             timestamp = float(packet.sniff_timestamp)
 
-            # Get source and destination
-            source = 'unknown'
-            destination = 'unknown'
+            # USB-level endpoints. The PC is always addressed as "host", so this
+            # determines direction regardless of what higher layer carries data.
+            usb_src = 'unknown'
+            usb_dst = 'unknown'
             if hasattr(packet, 'usb'):
-                source = getattr(packet.usb, 'src', 'unknown')
-                destination = getattr(packet.usb, 'dst', 'unknown')
+                usb_src = getattr(packet.usb, 'src', 'unknown')
+                usb_dst = getattr(packet.usb, 'dst', 'unknown')
+
+            # "host" as source means OUT (command to device); otherwise IN.
+            direction = "OUT" if str(usb_src).lower() == "host" else "IN"
+
+            # Defaults describe the USB endpoints; net packets override below.
+            source = usb_src
+            destination = usb_dst
+            protocol = "USB"
 
             # Try multiple possible data field locations
             raw_data = None
@@ -96,20 +132,34 @@ def extract_usb_packets(pcap_path: str) -> Generator[USBPacket, None, None]:
                     if out_payload:
                         raw_data = hex_to_bytes(out_payload)
 
+                if raw_data is not None:
+                    protocol = "SERIAL"
+
             # Check for generic USB leftover capture data
             if raw_data is None and hasattr(packet, 'usb'):
                 capdata = getattr(packet.usb, 'capdata', None)
                 if capdata:
                     raw_data = hex_to_bytes(capdata)
 
+            # Check for TCP payload carried over the USB link (network-over-USB)
+            if raw_data is None and include_net and hasattr(packet, 'tcp'):
+                payload = getattr(packet.tcp, 'payload', None)
+                if payload:
+                    raw_data = hex_to_bytes(str(payload))
+
+                    # Prefer IP/port endpoints for a meaningful description
+                    ip_layer = getattr(packet, 'ip', None) or getattr(packet, 'ipv6', None)
+                    src_ip = getattr(ip_layer, 'src', usb_src)
+                    dst_ip = getattr(ip_layer, 'dst', usb_dst)
+                    src_port = getattr(packet.tcp, 'srcport', '?')
+                    dst_port = getattr(packet.tcp, 'dstport', '?')
+                    source = f"{src_ip}:{src_port}"
+                    destination = f"{dst_ip}:{dst_port}"
+                    protocol = "HTTP" if hasattr(packet, 'http') else "TCP"
+
             # Skip packets without payload data
             if raw_data is None or len(raw_data) == 0:
                 continue
-
-            # Determine direction based on source
-            # "host" as source means OUT (command to device)
-            # anything else means IN (response from device)
-            direction = "OUT" if str(source).lower() == "host" else "IN"
 
             yield USBPacket(
                 timestamp=timestamp,
@@ -117,6 +167,7 @@ def extract_usb_packets(pcap_path: str) -> Generator[USBPacket, None, None]:
                 destination=str(destination),
                 direction=direction,
                 raw_data=raw_data,
+                protocol=protocol,
             )
         except (AttributeError, ValueError):
             # Packet doesn't have expected fields or invalid hex, skip
@@ -185,10 +236,10 @@ def format_labeled(packet: USBPacket, packet_num: int, raw_bytes: bool = False) 
 
     return (
         f"{separator}\n"
-        f"Packet #{packet_num} [{packet.direction}]\n"
+        f"Packet #{packet_num} [{packet.direction}] {packet.protocol}\n"
         f"{separator}\n"
         f"Timestamp:   {packet.timestamp}\n"
-        f"Direction:   {packet.source} {direction_arrow} {packet.destination}\n"
+        f"Endpoint:    {packet.source} {direction_arrow} {packet.destination}\n"
         f"{data_label}\n"
         f"{data_content}\n\n"
     )
@@ -208,7 +259,10 @@ def format_tsv(packet: USBPacket, raw_bytes: bool = False) -> str:
     data = bytes_to_hex(packet.raw_data) if raw_bytes else bytes_to_ascii(packet.raw_data)
     # Replace newlines with literal \n for TSV compatibility
     data_escaped = data.replace('\n', '\\n').replace('\t', '\\t')
-    return f"{packet.timestamp}\t{packet.direction}\t{packet.source}\t{packet.destination}\t{data_escaped}\n"
+    return (
+        f"{packet.timestamp}\t{packet.direction}\t{packet.protocol}\t"
+        f"{packet.source}\t{packet.destination}\t{data_escaped}\n"
+    )
 
 
 def format_gcode(packet: USBPacket, raw_bytes: bool = False) -> str:
@@ -256,13 +310,14 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Output formats:
   labeled  - Human-readable blocks with labels (default)
-  tsv      - Tab-separated: timestamp\\tdirection\\tsource\\tdest\\tdata
+  tsv      - Tab-separated: timestamp\\tdirection\\tprotocol\\tsource\\tdest\\tdata
   gcode    - Data with direction prefix (>>> OUT, <<< IN)
 
 Examples:
-  %(prog)s capture.pcap                    # Basic extraction
+  %(prog)s capture.pcap                    # Basic extraction (serial/capdata)
   %(prog)s capture.pcap -f gcode           # G-code only output
   %(prog)s capture.pcap -f tsv --raw-bytes # TSV with hex bytes
+  %(prog)s capture.pcap --net              # Also include network-over-USB TCP
         """
     )
     parser.add_argument(
@@ -283,6 +338,12 @@ Examples:
         "--raw-bytes",
         action="store_true",
         help="Output raw bytes as hex instead of ASCII"
+    )
+    parser.add_argument(
+        "-n", "--net",
+        action="store_true",
+        help="Also extract TCP payloads carried over the USB link "
+             "(network-over-USB via RNDIS/MBIM/ECM). Can be large/binary."
     )
     parser.add_argument(
         "-v", "--verbose",
@@ -320,6 +381,7 @@ def main() -> int:
     if args.verbose:
         print(f"Processing: {args.input_file}")
         print(f"Output format: {args.format}")
+        print(f"Network-over-USB: {'included' if args.net else 'excluded'}")
         print(f"Output file: {output_path}")
 
     # Process packets
@@ -329,9 +391,11 @@ def main() -> int:
         with open(output_path, 'w') as out:
             # Write header for TSV format
             if args.format == 'tsv':
-                out.write("timestamp\tdirection\tsource\tdestination\tdata\n")
+                out.write(
+                    "timestamp\tdirection\tprotocol\tsource\tdestination\tdata\n"
+                )
 
-            for packet in extract_usb_packets(args.input_file):
+            for packet in extract_usb_packets(args.input_file, include_net=args.net):
                 packet_count += 1
 
                 # Add blank line when direction changes

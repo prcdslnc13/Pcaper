@@ -87,12 +87,27 @@ python pcaper.py capture.pcap -f tsv
 # Raw hex bytes instead of ASCII
 python pcaper.py capture.pcap --raw-bytes
 
+# Also extract network-over-USB traffic (see below)
+python pcaper.py capture.pcap --net
+
 # Custom output file
 python pcaper.py capture.pcap -o output.txt
 
 # Verbose mode
 python pcaper.py capture.pcap -v
 ```
+
+### Network-over-USB (`--net`)
+
+Some devices (e.g. laser cutters, printers with a built-in web UI) present
+themselves as a USB *network adapter* (RNDIS/MBIM/ECM) and do most of their work
+over TCP/HTTP rather than a USB serial port. That traffic is invisible to the
+default serial/`capdata` extraction.
+
+Pass `--net` to also extract the TCP payloads carried over the USB link. Packets
+are labeled with their protocol (`TCP`/`HTTP`) and IP:port endpoints. Note this
+can produce large output and includes binary payloads (images, uploads), so
+combine with `--raw-bytes` or `-f tsv` when inspecting binary data.
 
 On Windows, you may need to use `py` instead of `python`:
 ```cmd
@@ -105,7 +120,7 @@ py pcaper.py capture.pcap -f gcode
 Human-readable blocks with metadata for each packet, showing direction and timestamps.
 
 ### TSV
-Tab-separated values with columns: `timestamp`, `direction`, `source`, `destination`, `data`
+Tab-separated values with columns: `timestamp`, `direction`, `protocol`, `source`, `destination`, `data`
 
 ### G-code
 Data with direction prefixes (`>>>` for commands sent, `<<<` for responses). Blank lines separate direction changes for readability.
