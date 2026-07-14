@@ -286,6 +286,43 @@ def format_gcode(packet: USBPacket, raw_bytes: bool = False) -> str:
     return '\n'.join(prefixed_lines) + '\n'
 
 
+def format_reassembled_stream(stream, raw_bytes: bool = False) -> str:
+    """
+    Format a reassembled TCP stream as a labeled block covering both directions.
+
+    Args:
+        stream: A reassemble.ReassembledStream instance
+        raw_bytes: If True, show hex bytes instead of ASCII
+
+    Returns:
+        Formatted string block
+    """
+    separator = "=" * 80
+    lines = [
+        separator,
+        f"Stream #{stream.stream}  {stream.client} <-> {stream.server}",
+        separator,
+    ]
+    if stream.start_ts:
+        lines.append(f"Time:        {stream.start_ts} - {stream.end_ts}")
+
+    for direction, label in (("c2s", "client -> server"),
+                             ("s2c", "server -> client")):
+        data = stream.data(direction)
+        if not data:
+            continue
+        gaps = stream.gaps.get(direction, [])
+        gap_note = f"  [MISSING BYTES: {gaps}]" if gaps else ""
+        content = bytes_to_hex(data) if raw_bytes else bytes_to_ascii(data)
+        lines.append("")
+        lines.append(f"--- {label} ({len(data)} bytes){gap_note} ---")
+        lines.append(content.rstrip("\n"))
+
+    lines.append("")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
 def generate_output_path(input_path: str) -> str:
     """
     Generate output filename from input path.
@@ -318,6 +355,8 @@ Examples:
   %(prog)s capture.pcap -f gcode           # G-code only output
   %(prog)s capture.pcap -f tsv --raw-bytes # TSV with hex bytes
   %(prog)s capture.pcap --net              # Also include network-over-USB TCP
+  %(prog)s capture.pcap --reassemble       # Full reassembled TCP streams
+  %(prog)s capture.pcap --extract-objects out/  # Carve HTTP files into out/
         """
     )
     parser.add_argument(
@@ -346,6 +385,18 @@ Examples:
              "(network-over-USB via RNDIS/MBIM/ECM). Can be large/binary."
     )
     parser.add_argument(
+        "-r", "--reassemble",
+        action="store_true",
+        help="Reassemble full TCP-over-USB streams (ordered, de-duplicated) "
+             "instead of per-packet payloads. Output is one block per stream."
+    )
+    parser.add_argument(
+        "--extract-objects",
+        metavar="DIR",
+        help="Recover complete HTTP bodies (files: images, uploads, etc.) "
+             "from the capture into DIR, plus a manifest.tsv. Ignores -f/-o."
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose output (show packet count, etc.)"
@@ -356,6 +407,66 @@ Examples:
         version=f"%(prog)s {__version__}"
     )
     return parser.parse_args()
+
+
+def run_extract_objects(args: argparse.Namespace) -> int:
+    """Recover complete HTTP bodies from the capture into a directory."""
+    import reassemble
+
+    objects = reassemble.extract_http_objects(args.input_file)
+    out_dir = Path(args.extract_objects)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for obj in objects:
+            (out_dir / obj.filename).write_bytes(obj.data)
+        with open(out_dir / "manifest.tsv", 'w', encoding='utf-8') as manifest:
+            manifest.write(
+                "index\tkind\tfilename\tsize\tcontent_type\turi\tmd5\n"
+            )
+            for obj in objects:
+                manifest.write(
+                    f"{obj.index}\t{obj.kind}\t{obj.filename}\t{obj.size}\t"
+                    f"{obj.content_type or '-'}\t{obj.uri or '-'}\t{obj.md5}\n"
+                )
+    except PermissionError:
+        print(f"Error: Cannot write to {out_dir}", file=sys.stderr)
+        return 1
+
+    if not objects:
+        print("Warning: No HTTP objects found in capture.", file=sys.stderr)
+        return 0
+
+    print(f"Extracted {len(objects)} object(s) to {out_dir}")
+    if args.verbose:
+        for obj in objects:
+            print(f"  #{obj.index} [{obj.kind}] {obj.filename} "
+                  f"({obj.size} bytes, {obj.content_type or 'unknown'})")
+    return 0
+
+
+def run_reassemble(args: argparse.Namespace, output_path: str) -> int:
+    """Reassemble TCP-over-USB streams and write them to the output file."""
+    import reassemble
+
+    streams = reassemble.reassemble_streams(args.input_file)
+    stream_count = 0
+    try:
+        with open(output_path, 'w', encoding='utf-8') as out:
+            for stream in streams:
+                if not stream.c2s and not stream.s2c:
+                    continue
+                stream_count += 1
+                out.write(format_reassembled_stream(stream, args.raw_bytes))
+    except PermissionError:
+        print(f"Error: Cannot write to {output_path}", file=sys.stderr)
+        return 1
+
+    if args.verbose:
+        print(f"Reassembled {stream_count} TCP stream(s)")
+        print(f"Output written to: {output_path}")
+    if stream_count == 0:
+        print("Warning: No TCP streams found in capture.", file=sys.stderr)
+    return 0
 
 
 def main() -> int:
@@ -380,9 +491,21 @@ def main() -> int:
 
     if args.verbose:
         print(f"Processing: {args.input_file}")
-        print(f"Output format: {args.format}")
-        print(f"Network-over-USB: {'included' if args.net else 'excluded'}")
-        print(f"Output file: {output_path}")
+        if args.extract_objects:
+            print(f"Mode: extract HTTP objects -> {args.extract_objects}")
+        elif args.reassemble:
+            print("Mode: reassemble TCP streams")
+            print(f"Output file: {output_path}")
+        else:
+            print(f"Output format: {args.format}")
+            print(f"Network-over-USB: {'included' if args.net else 'excluded'}")
+            print(f"Output file: {output_path}")
+
+    # Reassembly and object extraction take their own code paths
+    if args.extract_objects:
+        return run_extract_objects(args)
+    if args.reassemble:
+        return run_reassemble(args, output_path)
 
     # Process packets
     packet_count = 0
