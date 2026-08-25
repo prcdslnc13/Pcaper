@@ -7,6 +7,7 @@ recovering G-code sent to CNC machines, laser cutters, 3D printers, etc.
 """
 
 import argparse
+import asyncio
 import shutil
 import sys
 from dataclasses import dataclass
@@ -31,6 +32,22 @@ class USBPacket:
     destination: str
     direction: str  # "OUT" (host->device) or "IN" (device->host)
     raw_data: bytes
+    protocol: str = "USB"  # "SERIAL", "USB", "TCP", or "HTTP"
+
+
+def ensure_event_loop() -> None:
+    """
+    Ensure an asyncio event loop exists for the current thread.
+
+    pyshark relies on an implicit event loop in the main thread. Python 3.14
+    removed that implicit loop, so ``get_event_loop()`` raises RuntimeError and
+    pyshark fails with "There is no current event loop in thread 'MainThread'".
+    Creating one explicitly restores the expected behavior.
+    """
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
 
 def check_tshark() -> None:
@@ -52,33 +69,52 @@ def hex_to_bytes(hex_string: str) -> bytes:
     return bytes.fromhex(hex_clean)
 
 
-def extract_usb_packets(pcap_path: str) -> Generator[USBPacket, None, None]:
+def extract_usb_packets(
+    pcap_path: str,
+    include_net: bool = False,
+) -> Generator[USBPacket, None, None]:
     """
-    Extract USB packets with payload data from a pcap file.
+    Extract packets with payload data from a USB pcap file.
 
     Checks multiple possible data locations:
-    - usb.capdata (generic USB leftover capture data)
     - usbcom.data.in_payload (USB CDC serial incoming data)
     - usbcom.data.out_payload (USB CDC serial outgoing data)
+    - usb.capdata (generic USB leftover capture data)
+
+    When ``include_net`` is set, also extracts TCP payloads carried over the USB
+    link (network-over-USB via RNDIS/MBIM/ECM, i.e. usb -> eth -> ip -> tcp).
+    Many devices expose themselves as a USB network adapter and do the real work
+    over TCP/HTTP, which is invisible to the serial/capdata extraction above.
 
     Args:
         pcap_path: Path to the pcap file
+        include_net: If True, also yield TCP-over-USB payloads
 
     Yields:
         USBPacket objects for each packet containing payload data
     """
+    ensure_event_loop()
     cap = pyshark.FileCapture(pcap_path)
 
     for packet in cap:
         try:
             timestamp = float(packet.sniff_timestamp)
 
-            # Get source and destination
-            source = 'unknown'
-            destination = 'unknown'
+            # USB-level endpoints. The PC is always addressed as "host", so this
+            # determines direction regardless of what higher layer carries data.
+            usb_src = 'unknown'
+            usb_dst = 'unknown'
             if hasattr(packet, 'usb'):
-                source = getattr(packet.usb, 'src', 'unknown')
-                destination = getattr(packet.usb, 'dst', 'unknown')
+                usb_src = getattr(packet.usb, 'src', 'unknown')
+                usb_dst = getattr(packet.usb, 'dst', 'unknown')
+
+            # "host" as source means OUT (command to device); otherwise IN.
+            direction = "OUT" if str(usb_src).lower() == "host" else "IN"
+
+            # Defaults describe the USB endpoints; net packets override below.
+            source = usb_src
+            destination = usb_dst
+            protocol = "USB"
 
             # Try multiple possible data field locations
             raw_data = None
@@ -96,20 +132,34 @@ def extract_usb_packets(pcap_path: str) -> Generator[USBPacket, None, None]:
                     if out_payload:
                         raw_data = hex_to_bytes(out_payload)
 
+                if raw_data is not None:
+                    protocol = "SERIAL"
+
             # Check for generic USB leftover capture data
             if raw_data is None and hasattr(packet, 'usb'):
                 capdata = getattr(packet.usb, 'capdata', None)
                 if capdata:
                     raw_data = hex_to_bytes(capdata)
 
+            # Check for TCP payload carried over the USB link (network-over-USB)
+            if raw_data is None and include_net and hasattr(packet, 'tcp'):
+                payload = getattr(packet.tcp, 'payload', None)
+                if payload:
+                    raw_data = hex_to_bytes(str(payload))
+
+                    # Prefer IP/port endpoints for a meaningful description
+                    ip_layer = getattr(packet, 'ip', None) or getattr(packet, 'ipv6', None)
+                    src_ip = getattr(ip_layer, 'src', usb_src)
+                    dst_ip = getattr(ip_layer, 'dst', usb_dst)
+                    src_port = getattr(packet.tcp, 'srcport', '?')
+                    dst_port = getattr(packet.tcp, 'dstport', '?')
+                    source = f"{src_ip}:{src_port}"
+                    destination = f"{dst_ip}:{dst_port}"
+                    protocol = "HTTP" if hasattr(packet, 'http') else "TCP"
+
             # Skip packets without payload data
             if raw_data is None or len(raw_data) == 0:
                 continue
-
-            # Determine direction based on source
-            # "host" as source means OUT (command to device)
-            # anything else means IN (response from device)
-            direction = "OUT" if str(source).lower() == "host" else "IN"
 
             yield USBPacket(
                 timestamp=timestamp,
@@ -117,6 +167,7 @@ def extract_usb_packets(pcap_path: str) -> Generator[USBPacket, None, None]:
                 destination=str(destination),
                 direction=direction,
                 raw_data=raw_data,
+                protocol=protocol,
             )
         except (AttributeError, ValueError):
             # Packet doesn't have expected fields or invalid hex, skip
@@ -185,10 +236,10 @@ def format_labeled(packet: USBPacket, packet_num: int, raw_bytes: bool = False) 
 
     return (
         f"{separator}\n"
-        f"Packet #{packet_num} [{packet.direction}]\n"
+        f"Packet #{packet_num} [{packet.direction}] {packet.protocol}\n"
         f"{separator}\n"
         f"Timestamp:   {packet.timestamp}\n"
-        f"Direction:   {packet.source} {direction_arrow} {packet.destination}\n"
+        f"Endpoint:    {packet.source} {direction_arrow} {packet.destination}\n"
         f"{data_label}\n"
         f"{data_content}\n\n"
     )
@@ -208,7 +259,10 @@ def format_tsv(packet: USBPacket, raw_bytes: bool = False) -> str:
     data = bytes_to_hex(packet.raw_data) if raw_bytes else bytes_to_ascii(packet.raw_data)
     # Replace newlines with literal \n for TSV compatibility
     data_escaped = data.replace('\n', '\\n').replace('\t', '\\t')
-    return f"{packet.timestamp}\t{packet.direction}\t{packet.source}\t{packet.destination}\t{data_escaped}\n"
+    return (
+        f"{packet.timestamp}\t{packet.direction}\t{packet.protocol}\t"
+        f"{packet.source}\t{packet.destination}\t{data_escaped}\n"
+    )
 
 
 def format_gcode(packet: USBPacket, raw_bytes: bool = False) -> str:
@@ -230,6 +284,43 @@ def format_gcode(packet: USBPacket, raw_bytes: bool = False) -> str:
     lines = data.split('\n')
     prefixed_lines = [f"{prefix}{line}" for line in lines if line]
     return '\n'.join(prefixed_lines) + '\n'
+
+
+def format_reassembled_stream(stream, raw_bytes: bool = False) -> str:
+    """
+    Format a reassembled TCP stream as a labeled block covering both directions.
+
+    Args:
+        stream: A reassemble.ReassembledStream instance
+        raw_bytes: If True, show hex bytes instead of ASCII
+
+    Returns:
+        Formatted string block
+    """
+    separator = "=" * 80
+    lines = [
+        separator,
+        f"Stream #{stream.stream}  {stream.client} <-> {stream.server}",
+        separator,
+    ]
+    if stream.start_ts:
+        lines.append(f"Time:        {stream.start_ts} - {stream.end_ts}")
+
+    for direction, label in (("c2s", "client -> server"),
+                             ("s2c", "server -> client")):
+        data = stream.data(direction)
+        if not data:
+            continue
+        gaps = stream.gaps.get(direction, [])
+        gap_note = f"  [MISSING BYTES: {gaps}]" if gaps else ""
+        content = bytes_to_hex(data) if raw_bytes else bytes_to_ascii(data)
+        lines.append("")
+        lines.append(f"--- {label} ({len(data)} bytes){gap_note} ---")
+        lines.append(content.rstrip("\n"))
+
+    lines.append("")
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def generate_output_path(input_path: str) -> str:
@@ -256,13 +347,16 @@ def parse_args() -> argparse.Namespace:
         epilog="""
 Output formats:
   labeled  - Human-readable blocks with labels (default)
-  tsv      - Tab-separated: timestamp\\tdirection\\tsource\\tdest\\tdata
+  tsv      - Tab-separated: timestamp\\tdirection\\tprotocol\\tsource\\tdest\\tdata
   gcode    - Data with direction prefix (>>> OUT, <<< IN)
 
 Examples:
-  %(prog)s capture.pcap                    # Basic extraction
+  %(prog)s capture.pcap                    # Basic extraction (serial/capdata)
   %(prog)s capture.pcap -f gcode           # G-code only output
   %(prog)s capture.pcap -f tsv --raw-bytes # TSV with hex bytes
+  %(prog)s capture.pcap --net              # Also include network-over-USB TCP
+  %(prog)s capture.pcap --reassemble       # Full reassembled TCP streams
+  %(prog)s capture.pcap --extract-objects out/  # Carve HTTP files into out/
         """
     )
     parser.add_argument(
@@ -285,6 +379,24 @@ Examples:
         help="Output raw bytes as hex instead of ASCII"
     )
     parser.add_argument(
+        "-n", "--net",
+        action="store_true",
+        help="Also extract TCP payloads carried over the USB link "
+             "(network-over-USB via RNDIS/MBIM/ECM). Can be large/binary."
+    )
+    parser.add_argument(
+        "-r", "--reassemble",
+        action="store_true",
+        help="Reassemble full TCP-over-USB streams (ordered, de-duplicated) "
+             "instead of per-packet payloads. Output is one block per stream."
+    )
+    parser.add_argument(
+        "--extract-objects",
+        metavar="DIR",
+        help="Recover complete HTTP bodies (files: images, uploads, etc.) "
+             "from the capture into DIR, plus a manifest.tsv. Ignores -f/-o."
+    )
+    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose output (show packet count, etc.)"
@@ -295,6 +407,66 @@ Examples:
         version=f"%(prog)s {__version__}"
     )
     return parser.parse_args()
+
+
+def run_extract_objects(args: argparse.Namespace) -> int:
+    """Recover complete HTTP bodies from the capture into a directory."""
+    import reassemble
+
+    objects = reassemble.extract_http_objects(args.input_file)
+    out_dir = Path(args.extract_objects)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for obj in objects:
+            (out_dir / obj.filename).write_bytes(obj.data)
+        with open(out_dir / "manifest.tsv", 'w', encoding='utf-8') as manifest:
+            manifest.write(
+                "index\tkind\tfilename\tsize\tcontent_type\turi\tmd5\n"
+            )
+            for obj in objects:
+                manifest.write(
+                    f"{obj.index}\t{obj.kind}\t{obj.filename}\t{obj.size}\t"
+                    f"{obj.content_type or '-'}\t{obj.uri or '-'}\t{obj.md5}\n"
+                )
+    except PermissionError:
+        print(f"Error: Cannot write to {out_dir}", file=sys.stderr)
+        return 1
+
+    if not objects:
+        print("Warning: No HTTP objects found in capture.", file=sys.stderr)
+        return 0
+
+    print(f"Extracted {len(objects)} object(s) to {out_dir}")
+    if args.verbose:
+        for obj in objects:
+            print(f"  #{obj.index} [{obj.kind}] {obj.filename} "
+                  f"({obj.size} bytes, {obj.content_type or 'unknown'})")
+    return 0
+
+
+def run_reassemble(args: argparse.Namespace, output_path: str) -> int:
+    """Reassemble TCP-over-USB streams and write them to the output file."""
+    import reassemble
+
+    streams = reassemble.reassemble_streams(args.input_file)
+    stream_count = 0
+    try:
+        with open(output_path, 'w', encoding='utf-8') as out:
+            for stream in streams:
+                if not stream.c2s and not stream.s2c:
+                    continue
+                stream_count += 1
+                out.write(format_reassembled_stream(stream, args.raw_bytes))
+    except PermissionError:
+        print(f"Error: Cannot write to {output_path}", file=sys.stderr)
+        return 1
+
+    if args.verbose:
+        print(f"Reassembled {stream_count} TCP stream(s)")
+        print(f"Output written to: {output_path}")
+    if stream_count == 0:
+        print("Warning: No TCP streams found in capture.", file=sys.stderr)
+    return 0
 
 
 def main() -> int:
@@ -319,8 +491,21 @@ def main() -> int:
 
     if args.verbose:
         print(f"Processing: {args.input_file}")
-        print(f"Output format: {args.format}")
-        print(f"Output file: {output_path}")
+        if args.extract_objects:
+            print(f"Mode: extract HTTP objects -> {args.extract_objects}")
+        elif args.reassemble:
+            print("Mode: reassemble TCP streams")
+            print(f"Output file: {output_path}")
+        else:
+            print(f"Output format: {args.format}")
+            print(f"Network-over-USB: {'included' if args.net else 'excluded'}")
+            print(f"Output file: {output_path}")
+
+    # Reassembly and object extraction take their own code paths
+    if args.extract_objects:
+        return run_extract_objects(args)
+    if args.reassemble:
+        return run_reassemble(args, output_path)
 
     # Process packets
     packet_count = 0
@@ -329,9 +514,11 @@ def main() -> int:
         with open(output_path, 'w') as out:
             # Write header for TSV format
             if args.format == 'tsv':
-                out.write("timestamp\tdirection\tsource\tdestination\tdata\n")
+                out.write(
+                    "timestamp\tdirection\tprotocol\tsource\tdestination\tdata\n"
+                )
 
-            for packet in extract_usb_packets(args.input_file):
+            for packet in extract_usb_packets(args.input_file, include_net=args.net):
                 packet_count += 1
 
                 # Add blank line when direction changes
