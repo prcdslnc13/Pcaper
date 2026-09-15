@@ -17,7 +17,22 @@ python pcaper.py <input.pcap>
 
 # Run with verbose output
 python pcaper.py <input.pcap> -v
+
+# URB-level timeline (write-vs-read stalls) for one device
+python urbtrace.py <input.pcapng> --vidpid 0403:6001
+
+# Tests (synthetic inputs, no tshark needed)
+python tests/test_reassemble.py
+python tests/test_pcaper_serial.py
 ```
+
+## Capturing on Windows
+
+Use `capture-serial.ps1 -Port COMn` from an elevated shell. It resolves the
+USBPcap interface for the port, overrides Wireshark's saved extcap preferences
+(a saved "capture from all devices: false" makes every tshark/GUI capture on
+that interface empty), and prints a verdict on whether the device's traffic is
+actually in the file. See README "Empty captures".
 
 ## System Requirement
 
