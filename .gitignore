@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# USB captures -- large binaries, and reproducible with capture-serial.ps1.
+# Keep them out of the repo; analyse them where they were recorded.
+*.pcapng
+*.pcap
+# ...except the sample capture the worked example in the README refers to.
+!Camera-focus-job send.pcapng

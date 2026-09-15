@@ -2,8 +2,9 @@
 """
 Pcaper - Extract USB packet data from pcap captures.
 
-Extracts "Leftover Capture Data" from USB packets, useful for
-recovering G-code sent to CNC machines, laser cutters, 3D printers, etc.
+Extracts serial payloads (USB CDC and FTDI) and "Leftover Capture Data" from
+USB packets, useful for recovering G-code sent to CNC machines, laser cutters,
+3D printers, etc.
 """
 
 import argparse
@@ -12,7 +13,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 try:
     import pyshark
@@ -21,7 +22,15 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
+
+# Where the Wireshark installer puts tshark when it is not on PATH.
+TSHARK_WINDOWS_DEFAULT = r"C:\Program Files\Wireshark\tshark.exe"
+
+# tshark's protocol name for FTDI FT232/FT2232/FT4232 traffic. pyshark exposes
+# layers by attribute, and "ftdi-ft" cannot be spelled as one, so it is looked
+# up by name instead.
+FTDI_LAYER = "ftdi-ft"
 
 
 @dataclass
@@ -50,17 +59,50 @@ def ensure_event_loop() -> None:
         asyncio.set_event_loop(asyncio.new_event_loop())
 
 
-def check_tshark() -> None:
-    """Verify tshark is available on the system."""
-    if not shutil.which('tshark'):
-        print(
-            "Error: tshark not found. Please install Wireshark:\n"
-            "  macOS:   brew install wireshark\n"
-            "  Ubuntu:  sudo apt install tshark\n"
-            "  Windows: Install Wireshark from wireshark.org",
-            file=sys.stderr
-        )
-        sys.exit(1)
+def check_tshark() -> str:
+    """Locate tshark, preferring PATH but falling back to the Windows default."""
+    found = shutil.which('tshark')
+    if found:
+        return found
+    if Path(TSHARK_WINDOWS_DEFAULT).is_file():
+        return TSHARK_WINDOWS_DEFAULT
+    print(
+        "Error: tshark not found. Please install Wireshark:\n"
+        "  macOS:   brew install wireshark\n"
+        "  Ubuntu:  sudo apt install tshark\n"
+        "  Windows: Install Wireshark from wireshark.org, or add\n"
+        "           C:\\Program Files\\Wireshark to PATH",
+        file=sys.stderr
+    )
+    sys.exit(1)
+
+
+def find_layer(packet, name: str):
+    """Return the packet layer with this tshark protocol name, or None."""
+    for layer in getattr(packet, 'layers', []):
+        if layer.layer_name == name:
+            return layer
+    return None
+
+
+def ftdi_payload(layer) -> Optional[bytes]:
+    """
+    Serial bytes carried by one FTDI frame, or None if it carries none.
+
+    FTDI chips prefix every IN transfer with two modem/line-status bytes, and
+    the driver polls the chip continuously, so most IN frames are status only.
+    tshark's ftdi-ft dissector strips the status bytes and exposes real serial
+    data as ``if_<channel>_rx_payload`` / ``if_<channel>_tx_payload`` (one pair
+    per channel; FT2232/FT4232 parts have several). Reading those fields rather
+    than ``usb.capdata`` is what keeps the status bytes out of the extracted
+    stream and drops the empty polls.
+    """
+    for name in layer.field_names:
+        if name.endswith('_rx_payload') or name.endswith('_tx_payload'):
+            value = getattr(layer, name, None)
+            if value:
+                return hex_to_bytes(str(value))
+    return None
 
 
 def hex_to_bytes(hex_string: str) -> bytes:
@@ -72,14 +114,22 @@ def hex_to_bytes(hex_string: str) -> bytes:
 def extract_usb_packets(
     pcap_path: str,
     include_net: bool = False,
+    tshark_path: Optional[str] = None,
 ) -> Generator[USBPacket, None, None]:
     """
     Extract packets with payload data from a USB pcap file.
 
-    Checks multiple possible data locations:
+    Checks multiple possible data locations, most specific first:
     - usbcom.data.in_payload (USB CDC serial incoming data)
     - usbcom.data.out_payload (USB CDC serial outgoing data)
+    - ftdi-ft.if_*_rx_payload / if_*_tx_payload (FTDI serial data, status
+      bytes already stripped by the dissector)
     - usb.capdata (generic USB leftover capture data)
+
+    The protocol-aware fields only exist when tshark could identify the
+    device, which needs its descriptors in the capture. USBPcap injects them
+    for already-connected devices when "inject descriptors" is on, which
+    capture-serial.ps1 forces.
 
     When ``include_net`` is set, also extracts TCP payloads carried over the USB
     link (network-over-USB via RNDIS/MBIM/ECM, i.e. usb -> eth -> ip -> tcp).
@@ -89,12 +139,13 @@ def extract_usb_packets(
     Args:
         pcap_path: Path to the pcap file
         include_net: If True, also yield TCP-over-USB payloads
+        tshark_path: Explicit tshark executable, when it is not on PATH
 
     Yields:
         USBPacket objects for each packet containing payload data
     """
     ensure_event_loop()
-    cap = pyshark.FileCapture(pcap_path)
+    cap = pyshark.FileCapture(pcap_path, tshark_path=tshark_path)
 
     for packet in cap:
         try:
@@ -134,6 +185,14 @@ def extract_usb_packets(
 
                 if raw_data is not None:
                     protocol = "SERIAL"
+
+            # Check for FTDI serial data (FT232 and friends)
+            if raw_data is None:
+                ftdi = find_layer(packet, FTDI_LAYER)
+                if ftdi is not None:
+                    raw_data = ftdi_payload(ftdi)
+                    if raw_data is not None:
+                        protocol = "SERIAL"
 
             # Check for generic USB leftover capture data
             if raw_data is None and hasattr(packet, 'usb'):
@@ -474,7 +533,7 @@ def main() -> int:
     args = parse_args()
 
     # Check dependencies
-    check_tshark()
+    tshark_path = check_tshark()
 
     # Validate input file
     input_path = Path(args.input_file)
@@ -518,7 +577,8 @@ def main() -> int:
                     "timestamp\tdirection\tprotocol\tsource\tdestination\tdata\n"
                 )
 
-            for packet in extract_usb_packets(args.input_file, include_net=args.net):
+            for packet in extract_usb_packets(args.input_file, include_net=args.net,
+                                              tshark_path=tshark_path):
                 packet_count += 1
 
                 # Add blank line when direction changes
@@ -538,7 +598,12 @@ def main() -> int:
             print(f"Output written to: {output_path}")
 
         if packet_count == 0:
-            print("Warning: No packets with leftover capture data found.", file=sys.stderr)
+            print("Warning: No serial or leftover capture data found.\n"
+                  "  If the port was open during the capture, tshark may not have been\n"
+                  "  able to identify the device: FTDI and CDC payloads are only decoded\n"
+                  "  when the device descriptors are in the capture (capture-serial.ps1\n"
+                  "  injects them). Try --raw-bytes to see if anything is there at all.",
+                  file=sys.stderr)
 
         return 0
 

@@ -61,6 +61,64 @@ Alternatively, use the command line:
 "C:\Program Files\Wireshark\USBPcapCMD.exe" -d "\\.\USBPcap1" -o capture.pcap
 ```
 
+#### `capture-serial.ps1` (recommended)
+
+USBPcap attaches per *root hub*, so the interface number depends on which
+physical port the device is plugged into — capturing the wrong one silently
+records nothing useful. This helper resolves the interface at run time from the
+COM port (or the VID:PID), captures to a timestamped file, and then checks that
+the file actually contains the device's traffic:
+
+```powershell
+# from an elevated shell -- USBPcap will not give a handle to a non-admin process
+.\capture-serial.ps1 -Port COM10 -Tag jog-hang
+.\capture-serial.ps1 -VidPid 0403:6001 -Seconds 120 -Tag baseline      # FTDI FT232
+.\capture-serial.ps1 -Port COM10 -RingMinutes 5 -RingFiles 48 -Tag standing
+```
+
+Start the capture *before* the application opens the port; the open sequence
+(baud rate, flow control, DTR/RTS) is usually the most informative part.
+Ctrl-C stops the capture and still runs the checks. The verdict at the end
+tells apart four situations that all look like "no data" in Wireshark:
+
+| Verdict | Meaning |
+|---|---|
+| `EMPTY` | USBPcap recorded nothing at all — the capture never started (see below) |
+| none from VID:PID | traffic was recorded, but the device is on another root hub |
+| port never opened | device seen, but nothing opened the COM port during the capture |
+| no serial bytes | the port was opened; only FTDI status polls / control transfers |
+
+If it cannot match the device it prints every visible device tree rather than
+guessing which one you meant; pass the right one as `-Interface USBPcapN`.
+
+#### Empty captures: check Wireshark's preferences
+
+tshark launches USBPcapCMD with the options saved in Wireshark's preferences
+file (`%APPDATA%\Wireshark\preferences`). If *Capture from all devices* was
+ever unticked in the Wireshark GUI for an interface, it is saved as
+
+```
+extcap.____usbpcap1.capturefromalldevices: false
+extcap.____usbpcap1.injectdescriptors: false
+```
+
+and from then on **every** capture on that interface — GUI or tshark — records
+zero packets, not even the device descriptors. `capture-serial.ps1` overrides
+these for its own run and warns when it sees them. To fix the GUI, re-tick the
+options in the interface's options dialog (the gear icon next to `USBPcapN`),
+or delete those lines. The same override works for a plain tshark command:
+
+```cmd
+tshark -o extcap.____usbpcap1.capturefromalldevices:true -o extcap.____usbpcap1.injectdescriptors:true -i \\.\USBPcap1 -w capture.pcapng
+```
+
+The value must be lowercase `true`; tshark silently ignores `TRUE`.
+
+*Inject descriptors* matters beyond this: it is what lets tshark identify an
+already-connected device, and the CDC (`usbcom`) and FTDI (`ftdi-ft`)
+dissectors — and therefore `pcaper.py` and `urbtrace.py --vidpid` — only work
+when the descriptors are in the capture.
+
 ### Linux
 
 ```bash
@@ -102,6 +160,18 @@ python pcaper.py capture.pcap -o output.txt
 # Verbose mode
 python pcaper.py capture.pcap -v
 ```
+
+### USB serial adapters (CDC and FTDI)
+
+Serial payloads are read from tshark's protocol dissectors rather than from raw
+leftover data: `usbcom` for CDC-ACM ports (STM32 VCP, most boards that show up
+as "USB Serial Device (COMn)") and `ftdi-ft` for FTDI FT232/FT2232/FT4232
+adapters ("USB Serial Port (COMn)"). For FTDI this is essential — the chip
+prefixes every read with two status bytes and the driver polls it constantly,
+so raw capture data would be a stream of `01 60` noise with the real bytes
+buried in it. Both dissectors need the device descriptors in the capture (see
+*Inject descriptors* above); `pcaper.py` falls back to raw `usb.capdata` when
+they are absent and says so when it finds nothing.
 
 ### Network-over-USB (`--net`)
 
@@ -146,6 +216,62 @@ python pcaper.py capture.pcap --extract-objects recovered/
 On Windows, you may need to use `py` instead of `python`:
 ```cmd
 py pcaper.py capture.pcap -f gcode
+```
+
+## URB-level analysis (`urbtrace.py`)
+
+`pcaper.py` answers *what bytes crossed the link*. When an application stops
+talking to a device, that is not enough: a write that never completed, a read
+that was never issued, and a device that sent nothing all look identical at the
+payload layer. `urbtrace.py` pairs every URB submit with its completion, which
+tells them apart:
+
+| Symptom | What the capture shows |
+|---|---|
+| Blocked in `write()` | OUT URB submitted, never completed (or completes late / `CANCELED`) |
+| Blocked in `read()` | OUT URB completed normally, IN URBs stop being submitted |
+| Device sent nothing | IN URBs submitted and pending, no completion carries data |
+
+```bash
+# full URB timeline, wall-clock stamped to line up with an application log
+python urbtrace.py capture.pcapng --vidpid 0483:5740     # STM32 VCP (CDC)
+python urbtrace.py capture.pcapng --vidpid 0403:6001     # FTDI FT232
+
+# only transfers carrying payload
+python urbtrace.py capture.pcapng --vidpid 0483:5740 --data-only
+
+# diagnose one specific command
+python urbtrace.py capture.pcapng --verdict '$J='
+
+# machine-readable
+python urbtrace.py capture.pcapng -f tsv -o urbs.tsv
+```
+
+`--verdict TEXT` finds each OUT transfer containing `TEXT` and reports whether
+that write completed, how long it took, what came back afterwards, and whether
+the host kept requesting data at all.
+
+Timestamps are printed as local `HH:MM:SS.mmm` specifically so the timeline can
+be read side by side with an application's own debug log.
+
+### Reading the summary
+
+The summary (on stderr, so it never pollutes redirected output) reports **stuck
+transfers** and **quiet stretches**. Not every submit without a completion is a
+stall — drivers keep a rotating pool of reads outstanding, and CDC interrupt
+endpoints sit pending by design, so both are excluded. A transfer is only called
+stuck when it stayed outstanding far longer than that endpoint's own median
+completion latency. On a healthy capture the count is zero, so any non-zero
+count is worth reading.
+
+## Tests
+
+The tests use synthetic inputs only, so they need neither tshark nor a capture:
+
+```bash
+python tests/test_reassemble.py
+python tests/test_pcaper_serial.py
+# or, with pytest installed: python -m pytest tests/
 ```
 
 ## Output Formats
