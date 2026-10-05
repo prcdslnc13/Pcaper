@@ -21,6 +21,9 @@ python pcaper.py <input.pcap> -v
 # URB-level timeline (write-vs-read stalls) for one device
 python urbtrace.py <input.pcapng> --vidpid 0403:6001
 
+# Aliencell X1 (Aliencell Studio) ZeroMQ command timeline; --focus for AutoFocus/ExecFile start_z
+python aliencell.py <input.pcapng> --focus
+
 # Tests (synthetic inputs, no tshark needed)
 python tests/test_reassemble.py
 python tests/test_pcaper_serial.py

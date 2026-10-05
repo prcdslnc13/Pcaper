@@ -218,6 +218,29 @@ On Windows, you may need to use `py` instead of `python`:
 py pcaper.py capture.pcap -f gcode
 ```
 
+## Aliencell X1 command decoding (`aliencell.py`)
+
+Aliencell Studio drives the X1 over the network-over-USB link with ZeroMQ:
+TCP 6688 is the REQ/ROUTER command channel, TCP 6699 the PUB/SUB telemetry
+channel, and the job archive (`.al`, a zip) goes over HTTP on 3661. The message
+bodies are a private length-prefixed encoding, not msgpack, so `--net` shows
+them as noise. `aliencell.py` reassembles the streams, strips the ZMTP framing,
+decodes every message and pairs replies with requests:
+
+```bash
+python aliencell.py capture.pcapng            # command / reply / event timeline
+python aliencell.py capture.pcapng --focus    # only focus-plane / Z related messages + summary
+python aliencell.py capture.pcapng --all      # include every RealtimeData telemetry message
+python aliencell.py capture.pcapng --json     # one JSON object per message
+```
+
+Repeated `Status` publishes are collapsed to the fields that changed. The
+`--focus` summary lists each `AutoFocus` request, every change of
+`Status.focus_module.focus_distance` (`-1000` means "not measured"), and each
+`ExecFile` request with its `start_z_type` / `start_z`. In the sample capture
+the job's start Z arrives in `ExecFile` and equals the focus distance the
+`AutoFocus` step measured; the G-code inside the `.al` carries no Z move.
+
 ## URB-level analysis (`urbtrace.py`)
 
 `pcaper.py` answers *what bytes crossed the link*. When an application stops
